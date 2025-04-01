@@ -36,9 +36,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
@@ -64,25 +62,44 @@ public class CommonService {
     private static final int MAX_CONCURRENT_BATCHES = 5;
     private static final Semaphore semaphore = new Semaphore(MAX_CONCURRENT_BATCHES);
     private static final int API_COST_PER_CALL = 40;
-    private static final int MAX_POINTS = 19000;
+    private static final int MAX_POINTS = 20000;
     private static final int RECOVERY_RATE = 1000;
-    private static final int SAFE_THRESHOLD = 1000;
+    private static final int SAFE_THRESHOLD = 2000;
     private static final AtomicInteger remainingPoints = new AtomicInteger(MAX_POINTS);
 
 //    public ProductMigrationService(ProductIdsRepository productIdsRepository) {
 //            this.productIdsRepository = productIdsRepository;
 //        }
 
+    private final ScheduledExecutorService creditRecoveryScheduler = Executors.newScheduledThreadPool(1);
+    public CommonService(ObjectMapper objectMapper) {
+        creditRecoveryScheduler.scheduleAtFixedRate(() -> {
+            int currentPoints = remainingPoints.get();
+            if (currentPoints < MAX_POINTS) {
+                int newPoints = Math.min(RECOVERY_RATE, MAX_POINTS - currentPoints);
+                remainingPoints.addAndGet(newPoints);
+                logger.debug("Recovered {} API points. Current points: {}", newPoints, remainingPoints.get());
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+    }
+
     private void regulateApiRate() {
-        if (remainingPoints.get() < SAFE_THRESHOLD) {
-            int waitTime = Math.min(5, (MAX_POINTS - remainingPoints.get()) / RECOVERY_RATE);
-            logger.info("Low API points (" + remainingPoints.get() + "), pausing for " + waitTime + " seconds to recover.");
+        int maxWaitTime = 10; // Maximum wait time in seconds
+        int waitTime = 0;
+
+        while (remainingPoints.get() < SAFE_THRESHOLD) {
+            if (waitTime >= maxWaitTime) {
+                logger.warn("API points still low after waiting {} seconds. Continuing anyway.", maxWaitTime);
+                break;
+            }
+            logger.info("Low API points ({}), pausing until recovery...", remainingPoints.get());
             try {
-                TimeUnit.SECONDS.sleep(waitTime);
+                Thread.sleep(1000); // Wait 1 second for recovery
+                waitTime++;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                break;
             }
-            remainingPoints.addAndGet(waitTime * RECOVERY_RATE);  // Thread-safe increment
         }
     }
 
@@ -377,6 +394,7 @@ public class CommonService {
     }
 
     public ResponseEntity<?> migrateProductShopify(String productId, HttpServletRequest servletRequest, HttpServletResponse servletResponse) {
+        Map<String, Object> responseMap = new HashMap<>();
         try {
             String startTime = ZonedDateTime.now(ZoneId.of("Asia/Kolkata"))
                     .format(DateTimeFormatter.ofPattern("dd MM yyyy hh:mm:ss a z"));
@@ -384,7 +402,9 @@ public class CommonService {
 
             if (StringUtils.isBlank(productId)) {
                 logger.error("No product ID provided. Skipping processing.");
-                return ResponseEntity.badRequest().body("Please provide a valid product ID.");
+                responseMap.put("status", "400 BAD_REQUEST");
+                responseMap.put("message", "Please provide a valid product ID.");
+                return ResponseEntity.badRequest().body(responseMap);
             }
 
             logger.info("Processing product ID: {}", productId);
@@ -392,8 +412,9 @@ public class CommonService {
 
             if (apiResponse == null || apiResponse.isEmpty()) {
                 logger.error("API response is null or empty for product ID: {}", productId);
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body("Failed to fetch product details from abelini api for product ID: " + productId);
+                responseMap.put("status", "500 INTERNAL_SERVER_ERROR");
+                responseMap.put("message", "Failed to fetch product details from abelini API for product ID: " + productId);
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(responseMap);
             }
 
             Map<String, Object> data = processResponse(apiResponse);
@@ -407,8 +428,9 @@ public class CommonService {
 
             if (response == null) {
                 logger.error("Shopify response is null for product ID: {}", productId);
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body("Failed to create product in Shopify for product ID: " + productId);
+                responseMap.put("status", "500 INTERNAL_SERVER_ERROR");
+                responseMap.put("message", "Failed to create product in Shopify for product ID: " + productId);
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(responseMap);
             }
 
             Map<String, String> extractedIds = extractProductIdAndVariendId(response);
@@ -424,12 +446,17 @@ public class CommonService {
                     .format(DateTimeFormatter.ofPattern("dd MM yyyy hh:mm:ss a z"));
             logger.info("Product import completed. Started at: {} and ended at: {}", startTime, endTime);
 
-            return ResponseEntity.ok("Product successfully created in Shopify with product ID: " + shopifyProductId);
+            responseMap.put("status", "200 OK");
+            responseMap.put("message", "Product successfully created in Shopify.");
+            responseMap.put("result", shopifyProductId);
+
+            return ResponseEntity.ok(responseMap);
 
         } catch (Exception e) {
             logger.error("Error in product creation for ID: {} :: {}", productId, e.getMessage(), e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body("Error processing product ID: " + productId + ". Error: " + e.getMessage());
+            responseMap.put("status", "500 INTERNAL_SERVER_ERROR");
+            responseMap.put("message", "Error processing product ID: " + productId + ". Error: " + e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(responseMap);
         }
     }
 
@@ -798,6 +825,9 @@ public class CommonService {
         addMetafield(processedMetafields, rawMetafields, "multistone", "single_line_text_field");
         addMetafield(processedMetafields, rawMetafields, "rrp", "single_line_text_field");
         addMetafield(processedMetafields, rawMetafields, "setting_code", "single_line_text_field");
+
+        addMetafield(processedMetafields, rawMetafields, "having_stone_type", "multi_line_text_field");
+        addMetafield(processedMetafields, rawMetafields, "having_stone_shape", "multi_line_text_field");
 
         addMetafield(processedMetafields, rawMetafields, "filter", "multi_line_text_field");
         addMetafield(processedMetafields, rawMetafields, "model", "single_line_text_field");
@@ -1263,23 +1293,18 @@ public class CommonService {
 
             logger.info("Extracting names for filter_group_id: {} :: {}", targetFilterGroupId, rootNode.toPrettyString());
 
-            // Ensure the root node is an array
-            if (!rootNode.isArray()) {
-                logger.warn("JSON root is not an array. Expected an array of filter objects.");
-                return names;
-            }
-
-            // Iterate over each filter object
-            for (JsonNode filter : rootNode) {
-                if (filter.has("filter_group_id") && filter.has("name")) {
-                    String filterGroupId = filter.get("filter_group_id").asText();
-
-                    if (targetFilterGroupId.equals(filterGroupId)) {
-                        String name = filter.get("name").asText();
-                        logger.info("Found name: {}", name);
-                        names.add(name);
-                    }
+            if (rootNode.isArray()) {
+                // Process JSON if it's an array
+                for (JsonNode filter : rootNode) {
+                    processFilterNode(filter, targetFilterGroupId, names);
                 }
+            } else if (rootNode.isObject()) {
+                // Process JSON if it's an object
+                for (JsonNode filter : rootNode) {
+                    processFilterNode(filter, targetFilterGroupId, names);
+                }
+            } else {
+                logger.warn("Unexpected JSON structure. Expected an array or object.");
             }
 
         } catch (Exception e) {
@@ -1287,6 +1312,18 @@ public class CommonService {
         }
 
         return names;
+    }
+
+    private void processFilterNode(JsonNode filter, String targetFilterGroupId, List<String> names) {
+        if (filter.has("filter_group_id") && filter.has("name")) {
+            String filterGroupId = filter.get("filter_group_id").asText();
+
+            if (targetFilterGroupId.equals(filterGroupId)) {
+                String name = filter.get("name").asText();
+                logger.info("Found name: {}", name);
+                names.add(name);
+            }
+        }
     }
 
 
